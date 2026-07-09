@@ -468,6 +468,183 @@ app.get("/api/me", requireAuth, (req, res) => {
   res.json({ ok: true, advisor: { id: req.advisor.sub, name: req.advisor.name } });
 });
 
+/* =====================================================================
+   DW PHASE 2a - SHARED CLIENT RECORDS IN ZOHO
+   ---------------------------------------------------------------------
+   Client records are ~469 KB of JSON. Zoho multi-line fields cap at ~64 KB,
+   so each record is stored as a FILE in a File-Upload field.
+
+   Zoho quirk (confirmed in their docs): the Add/Update Records API cannot set a
+   file-upload field. Every save is therefore two calls:
+       1. upsert the row  (Client_ID, Client_Name, Updated_At, Updated_By, Version)
+       2. POST the JSON   .../report/{report}/{recordId}/{field}/upload   (multipart)
+   Reads mirror that:  find row -> GET .../{recordId}/{field}/download
+
+   Concurrency: each row carries Version. A save must send the baseVersion it read.
+   If they differ, another advisor saved in the meantime -> 409 with who/when,
+   and the app warns instead of silently overwriting their work.
+   ===================================================================== */
+const CR_FORM = process.env.ZOHO_CLIENT_RECORDS_FORM || "";
+const CR_REPORT = process.env.ZOHO_CLIENT_RECORDS_REPORT || "";
+const CR_FILE_FIELD = process.env.ZOHO_CLIENT_RECORDS_FILE_FIELD || "Record_File";
+const SKIP_WF = 'skip_workflow=["schedules","form_workflow"]';
+
+function crRowToSummary(row) {
+  return {
+    clientId: creatorDisplayValue(row.Client_ID).trim(),
+    clientName: creatorDisplayValue(row.Client_Name).trim(),
+    updatedAt: creatorDisplayValue(row.Updated_At).trim(),
+    updatedBy: creatorDisplayValue(row.Updated_By).trim(),
+    version: Number(creatorDisplayValue(row.Version)) || 0,
+    recordId: row.ID,
+  };
+}
+
+async function crFetchRows(criteria) {
+  if (!CR_REPORT) throw new Error("ZOHO_CLIENT_RECORDS_REPORT is not set");
+  const accessToken = await getAccessToken();
+  let url = `${creatorUrl(CR_REPORT)}?max_records=200`;
+  if (criteria) url += `&criteria=${encodeURIComponent(criteria)}`;
+  const response = await fetch(url, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+  const data = await response.json();
+  if (data && data.code && data.code !== 3000 && !zohoIsEmptyReport(data)) throw new Error(JSON.stringify(data));
+  const rows = (!zohoIsEmptyReport(data) && Array.isArray(data.data)) ? data.data : [];
+  return rows;
+}
+
+async function crFindRow(clientId) {
+  const rows = await crFetchRows(`Client_ID=="${String(clientId).replace(/"/g, "")}"`);
+  if (!rows.length) return null;
+  return crRowToSummary(rows[0]);
+}
+
+async function crUpsertRow(clientId, fields) {
+  const accessToken = await getAccessToken();
+  const existing = await crFindRow(clientId);
+  if (existing) {
+    const response = await fetch(`${creatorUrl(CR_REPORT)}/${existing.recordId}?${SKIP_WF}`, {
+      method: "PATCH",
+      headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ data: fields }),
+    });
+    const data = await response.json();
+    if (data && data.code && data.code !== 3000) throw new Error(JSON.stringify(data));
+    return existing.recordId;
+  }
+  if (!CR_FORM) throw new Error("ZOHO_CLIENT_RECORDS_FORM is not set");
+  const response = await fetch(`${creatorFormUrl(CR_FORM)}?${SKIP_WF}`, {
+    method: "POST",
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ data: [fields] }),
+  });
+  const data = await response.json();
+  if (data && data.code && data.code !== 3000) throw new Error(JSON.stringify(data));
+  const created = await crFindRow(clientId);
+  if (!created) throw new Error("record created but not found in report");
+  return created.recordId;
+}
+
+async function crUploadRecordFile(recordId, clientId, recordJson) {
+  const accessToken = await getAccessToken();
+  const form = new FormData();
+  form.append("file", new Blob([recordJson], { type: "application/json" }), `client_${clientId}.json`);
+  const response = await fetch(`${creatorUrl(CR_REPORT)}/${recordId}/${CR_FILE_FIELD}/upload?${SKIP_WF}`, {
+    method: "POST",
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+    body: form,
+  });
+  const data = await response.json().catch(function () { return null; });
+  if (data && data.code && data.code !== 3000) throw new Error(JSON.stringify(data));
+  return true;
+}
+
+async function crDownloadRecordFile(recordId) {
+  const accessToken = await getAccessToken();
+  const response = await fetch(`${creatorUrl(CR_REPORT)}/${recordId}/${CR_FILE_FIELD}/download`, {
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+  });
+  if (!response.ok) throw new Error("file download failed: HTTP " + response.status);
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new Error("stored record is not valid JSON");
+  }
+}
+
+/* ---- list every client (shared workspace: all advisors see all clients) ---- */
+app.get("/api/clients", requireAuth, async (req, res) => {
+  try {
+    const rows = await crFetchRows(null);
+    const clients = rows.map(crRowToSummary).filter((c) => c.clientId);
+    clients.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+    res.json({ ok: true, clients });
+  } catch (error) {
+    console.error("[DocWealth] /api/clients failed", error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+/* ---- fetch one full client record ---- */
+app.get("/api/client/:clientId", requireAuth, async (req, res) => {
+  try {
+    const clientId = String(req.params.clientId || "").trim();
+    if (!clientId) return res.status(400).json({ ok: false, error: "missing_client_id" });
+    const row = await crFindRow(clientId);
+    if (!row) return res.status(404).json({ ok: false, error: "not_found" });
+    const record = await crDownloadRecordFile(row.recordId);
+    res.json({ ok: true, clientId, version: row.version, updatedAt: row.updatedAt, updatedBy: row.updatedBy, record });
+  } catch (error) {
+    console.error("[DocWealth] GET /api/client failed", error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+/* ---- save a client record (optimistic locking on Version) ---- */
+app.post("/api/client/:clientId", requireAuth, async (req, res) => {
+  try {
+    const clientId = String(req.params.clientId || "").trim();
+    if (!clientId) return res.status(400).json({ ok: false, error: "missing_client_id" });
+
+    const body = req.body || {};
+    const record = body.record;
+    if (!record || typeof record !== "object") return res.status(400).json({ ok: false, error: "missing_record" });
+
+    const baseVersion = Number(body.baseVersion);
+    const existing = await crFindRow(clientId);
+
+    /* stale-edit guard: someone else saved since this advisor loaded the record */
+    if (existing && Number.isFinite(baseVersion) && existing.version !== baseVersion) {
+      return res.status(409).json({
+        ok: false,
+        error: "conflict",
+        currentVersion: existing.version,
+        updatedBy: existing.updatedBy,
+        updatedAt: existing.updatedAt,
+      });
+    }
+
+    const nextVersion = (existing ? existing.version : 0) + 1;
+    const advisorId = (req.advisor && req.advisor.sub) || "";
+    const advisorName = (req.advisor && req.advisor.name) || advisorId;
+    const clientName = String(body.clientName || record.clientName || "").trim();
+
+    const recordId = await crUpsertRow(clientId, {
+      Client_ID: clientId,
+      Client_Name: clientName,
+      Updated_At: new Date().toISOString(),
+      Updated_By: `${advisorName} (${advisorId})`,
+      Version: nextVersion,
+    });
+
+    await crUploadRecordFile(recordId, clientId, JSON.stringify(record));
+    res.json({ ok: true, clientId, version: nextVersion, updatedBy: `${advisorName} (${advisorId})` });
+  } catch (error) {
+    console.error("[DocWealth] POST /api/client failed", error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 /* Zoho Documents report is the truth for "did this client submit?".
    Used to self-heal a portal link whose status was never marked Submitted. */
 const ZOHO_SUBMIT_CACHE = new Map();
