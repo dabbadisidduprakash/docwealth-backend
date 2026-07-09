@@ -92,12 +92,12 @@ async function loadPortalIndex(force) {
   });
   const data = await response.json();
 
-  /* 3100 = "no records found" on an empty report; treat as empty, not an error */
-  if (data && data.code && data.code !== 3000 && data.code !== 3100) {
+  /* an empty report answers 3100 or 9220 depending on API version: not an error */
+  if (data && data.code && data.code !== 3000 && !zohoIsEmptyReport(data)) {
     throw new Error(JSON.stringify(data));
   }
 
-  const rows = Array.isArray(data.data) ? data.data : [];
+  const rows = (!zohoIsEmptyReport(data) && Array.isArray(data.data)) ? data.data : [];
   const byKey = new Map();
   const idByKey = new Map();
   rows.forEach((row) => {
@@ -294,6 +294,14 @@ const SESSION_SECRET = process.env.SESSION_SECRET || "";
 const ADMIN_KEY = process.env.ADMIN_KEY || "";
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; /* 30 days */
 
+/* Zoho returns a non-3000 code when a report is EMPTY, and the code differs by
+   API version: 3100 and 9220 both mean "no records exist in this report".
+   Treat them as an empty list, never as an error. */
+function zohoIsEmptyReport(data) {
+  if (!data || !data.code) return false;
+  return data.code === 3100 || data.code === 9220;
+}
+
 /* ---- password hashing (scrypt) ---- */
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString("hex");
@@ -354,9 +362,9 @@ async function loadAdvisors(force) {
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
   });
   const data = await response.json();
-  if (data && data.code && data.code !== 3000 && data.code !== 3100) throw new Error(JSON.stringify(data));
+  if (data && data.code && data.code !== 3000 && !zohoIsEmptyReport(data)) throw new Error(JSON.stringify(data));
 
-  const rows = Array.isArray(data.data) ? data.data : [];
+  const rows = (!zohoIsEmptyReport(data) && Array.isArray(data.data)) ? data.data : [];
   const byId = new Map();
   const idByAdvisor = new Map();
   rows.forEach((row) => {
