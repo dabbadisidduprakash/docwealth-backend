@@ -263,6 +263,24 @@ function creatorRecordTime(record) {
 const ZOHO_SUBMIT_CACHE = new Map();
 const ZOHO_SUBMIT_TTL_MS = 60 * 1000;
 
+/* Build an ISO timestamp SAFELY.
+   creatorRecordTime() falls back to the numeric Zoho record ID (e.g. 301419000000031007)
+   when the record carries no Modified_Time. That number is far outside the valid JS Date
+   range (+/-8.64e15 ms), so new Date(id).toISOString() throws RangeError: Invalid time value.
+   It is fine for SORTING (as the original code uses it) but must never be turned into a Date. */
+function submissionTimestamp(record) {
+  const raw = record && (record.Modified_Time || record.Created_Time || record.Added_Time);
+  const parsed = Date.parse(raw || "");
+  if (Number.isFinite(parsed)) {
+    try {
+      return new Date(parsed).toISOString();
+    } catch (error) {
+      /* fall through */
+    }
+  }
+  return new Date().toISOString();
+}
+
 async function zohoLatestSubmission(clientId) {
   if (!clientId) return null;
   const hit = ZOHO_SUBMIT_CACHE.get(clientId);
@@ -281,7 +299,7 @@ async function zohoLatestSubmission(clientId) {
     .sort((a, b) => creatorRecordTime(b) - creatorRecordTime(a));
 
   const latest = matches[0] || null;
-  const value = latest ? new Date(creatorRecordTime(latest) || Date.now()).toISOString() : null;
+  const value = latest ? submissionTimestamp(latest) : null;
   ZOHO_SUBMIT_CACHE.set(clientId, { at: Date.now(), value });
   return value;
 }
