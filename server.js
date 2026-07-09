@@ -6,7 +6,23 @@ const fs = require("fs");
 const path = require("path");
 
 const app = express();
-app.use(cors());
+
+/* DW SECURITY 1 - CORS ALLOWLIST.
+   app.use(cors()) allowed ANY website on the internet to call this API from a victim's
+   browser. Restrict to our own origins. Override with ALLOWED_ORIGINS (comma separated). */
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
+  "https://dabbadisidduprakash.github.io,https://docwealth.in,https://www.docwealth.in")
+  .split(",").map((o) => o.trim()).filter(Boolean);
+
+app.use(cors({
+  origin(origin, callback) {
+    /* no Origin header = curl / server-to-server / same-origin navigation: allow */
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    console.warn("[DocWealth] blocked CORS origin:", origin);
+    return callback(new Error("Origin not allowed"));
+  },
+}));
 app.use(express.json({ limit: "25mb" }));
 
 const PORT = process.env.PORT || 3000;
@@ -425,7 +441,15 @@ app.post("/api/portal-submit", async (req, res) => {
     const portalToken = payload.portalToken || "";
     const existing = await findPortalRecord(clientId, portalToken);
 
-    if (existing && (existing.portalStatus === "Submitted" || existing.portalStatus === "Locked")) {
+    /* DW SECURITY 2 - AUTHENTICATE THE SUBMISSION.
+       Previously any anonymous POST with an arbitrary clientId/portalToken was written
+       straight into Zoho. Only accept a clientId+token pair the advisor app has registered. */
+    if (!existing) {
+      console.warn("[DocWealth] rejected portal-submit for unregistered client:", clientId);
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    if (existing.portalStatus === "Submitted" || existing.portalStatus === "Locked") {
       return res.status(409).json({ ok: false, error: "Portal already submitted. Planner must request correction before client can resubmit." });
     }
 
