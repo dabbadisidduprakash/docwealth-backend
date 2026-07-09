@@ -493,7 +493,9 @@ app.get("/api/me", requireAuth, (req, res) => {
 const CR_FORM = process.env.ZOHO_CLIENT_RECORDS_FORM || "";
 const CR_REPORT = process.env.ZOHO_CLIENT_RECORDS_REPORT || "";
 const CR_FILE_FIELD = process.env.ZOHO_CLIENT_RECORDS_FILE_FIELD || "Record_File";
-
+/* NOTE: skip_workflow is NOT a valid query parameter on these endpoints.
+   Passing it returns {"code":1060,"description":"Invalid request parameter found - skip_workflow"}.
+   It is only an optimisation, so it is omitted entirely. */
 
 function crRowToSummary(row) {
   return {
@@ -503,30 +505,22 @@ function crRowToSummary(row) {
     updatedBy: creatorDisplayValue(row.Updated_By).trim(),
     version: Number(creatorDisplayValue(row.Version)) || 0,
     recordId: row.ID,
-     filePath: creatorDisplayValue(row[CR_FILE_FIELD]).trim(),
+    /* Zoho stores a file-upload field as a path string. /download REQUIRES it:
+       without ?filepath=... it answers {"code":3790,"message":"File path is mandatory..."} */
+    filePath: creatorDisplayValue(row[CR_FILE_FIELD]).trim(),
   };
 }
 
-async function crDownloadRecordFile(recordId, filePath) {
-  if (!filePath) throw new Error("no record file attached to this client");
+async function crFetchRows(criteria) {
+  if (!CR_REPORT) throw new Error("ZOHO_CLIENT_RECORDS_REPORT is not set");
   const accessToken = await getAccessToken();
-  const url = `${creatorUrl(CR_REPORT)}/${recordId}/${CR_FILE_FIELD}/download?filepath=${encodeURIComponent(filePath)}`;
+  let url = `${creatorUrl(CR_REPORT)}?max_records=200`;
+  if (criteria) url += `&criteria=${encodeURIComponent(criteria)}`;
   const response = await fetch(url, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
-  if (!response.ok) throw new Error("file download failed: HTTP " + response.status);
-
-  const text = await response.text();
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch (error) {
-    throw new Error("stored record is not valid JSON");
-  }
-
-  /* A Zoho error is itself valid JSON, e.g. {"code":3790,...}. Never hand that back as a record. */
-  if (parsed && typeof parsed === "object" && parsed.code && (parsed.message || parsed.description) && !Object.prototype.hasOwnProperty.call(parsed, "fields")) {
-    throw new Error("zoho download error: " + JSON.stringify(parsed));
-  }
-  return parsed;
+  const data = await response.json();
+  if (data && data.code && data.code !== 3000 && !zohoIsEmptyReport(data)) throw new Error(JSON.stringify(data));
+  const rows = (!zohoIsEmptyReport(data) && Array.isArray(data.data)) ? data.data : [];
+  return rows;
 }
 
 async function crFindRow(clientId) {
@@ -549,7 +543,7 @@ async function crUpsertRow(clientId, fields) {
     return existing.recordId;
   }
   if (!CR_FORM) throw new Error("ZOHO_CLIENT_RECORDS_FORM is not set");
-  const response = await fetch(`${creatorFormUrl(CR_FORM)}`, {
+  const response = await fetch(creatorFormUrl(CR_FORM), {
     method: "POST",
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, "Content-Type": "application/json" },
     body: JSON.stringify({ data: [fields] }),
@@ -587,18 +581,27 @@ async function crUploadRecordFile(recordId, clientId, recordJson) {
   return true;
 }
 
-async function crDownloadRecordFile(recordId) {
+async function crDownloadRecordFile(recordId, filePath) {
+  if (!filePath) throw new Error("no record file attached to this client");
   const accessToken = await getAccessToken();
-  const response = await fetch(`${creatorUrl(CR_REPORT)}/${recordId}/${CR_FILE_FIELD}/download`, {
-    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
-  });
+  const url = `${creatorUrl(CR_REPORT)}/${recordId}/${CR_FILE_FIELD}/download?filepath=${encodeURIComponent(filePath)}`;
+  const response = await fetch(url, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
   if (!response.ok) throw new Error("file download failed: HTTP " + response.status);
+
   const text = await response.text();
+  let parsed;
   try {
-    return JSON.parse(text);
+    parsed = JSON.parse(text);
   } catch (error) {
     throw new Error("stored record is not valid JSON");
   }
+
+  /* A Zoho error is itself valid JSON, e.g. {"code":3790,"message":"File path is mandatory..."}.
+     Never hand that back to the app as though it were the client's record. */
+  if (parsed && typeof parsed === "object" && parsed.code && (parsed.message || parsed.description) && !Object.prototype.hasOwnProperty.call(parsed, "fields")) {
+    throw new Error("zoho download error: " + JSON.stringify(parsed));
+  }
+  return parsed;
 }
 
 /* ---- list every client (shared workspace: all advisors see all clients) ---- */
