@@ -493,7 +493,7 @@ app.get("/api/me", requireAuth, (req, res) => {
 const CR_FORM = process.env.ZOHO_CLIENT_RECORDS_FORM || "";
 const CR_REPORT = process.env.ZOHO_CLIENT_RECORDS_REPORT || "";
 const CR_FILE_FIELD = process.env.ZOHO_CLIENT_RECORDS_FILE_FIELD || "Record_File";
-const SKIP_WF = 'skip_workflow=["schedules","form_workflow"]';
+
 
 function crRowToSummary(row) {
   return {
@@ -528,7 +528,7 @@ async function crUpsertRow(clientId, fields) {
   const accessToken = await getAccessToken();
   const existing = await crFindRow(clientId);
   if (existing) {
-    const response = await fetch(`${creatorUrl(CR_REPORT)}/${existing.recordId}?${SKIP_WF}`, {
+    const response = await fetch(`${creatorUrl(CR_REPORT)}/${existing.recordId}`, {
       method: "PATCH",
       headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, "Content-Type": "application/json" },
       body: JSON.stringify({ data: fields }),
@@ -538,7 +538,7 @@ async function crUpsertRow(clientId, fields) {
     return existing.recordId;
   }
   if (!CR_FORM) throw new Error("ZOHO_CLIENT_RECORDS_FORM is not set");
-  const response = await fetch(`${creatorFormUrl(CR_FORM)}?${SKIP_WF}`, {
+  const response = await fetch(`${creatorFormUrl(CR_FORM)}`, {
     method: "POST",
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, "Content-Type": "application/json" },
     body: JSON.stringify({ data: [fields] }),
@@ -566,7 +566,7 @@ async function crUploadRecordFile(recordId, clientId, recordJson) {
   const accessToken = await getAccessToken();
   const form = new FormData();
   form.append("file", new Blob([recordJson], { type: "application/json" }), `client_${clientId}.json`);
-  const response = await fetch(`${creatorUrl(CR_REPORT)}/${recordId}/${CR_FILE_FIELD}/upload?${SKIP_WF}`, {
+  const response = await fetch(`${creatorUrl(CR_REPORT)}/${recordId}/${CR_FILE_FIELD}/upload`, {
     method: "POST",
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
     body: form,
