@@ -499,6 +499,23 @@ const CR_KEEP_VERSIONS = Math.max(1, Number(process.env.ZOHO_CLIENT_RECORDS_KEEP
    Passing it returns {"code":1060,"description":"Invalid request parameter found - skip_workflow"}.
    It is only an optimisation, so it is omitted entirely. */
 
+/* Zoho returns a file-upload field as an ARRAY of download URLs, e.g.
+     ["/api/v2.1/<owner>/<app>/report/<report>/<id>/Record_File/download?filepath=1783616295998323_client_X.json"]
+   The /download endpoint wants ONLY the filepath query value ("1783616295998323_client_X.json").
+   Passing the whole URL returns {"code":3800,"message":"File path doesn't match for the provided record ID"}.
+   An empty array means no file is attached. */
+function crFilePathFromRow(row) {
+  const raw = row && row[CR_FILE_FIELD];
+  let entry = "";
+  if (Array.isArray(raw)) entry = raw.length ? String(raw[raw.length - 1]) : "";
+  else if (typeof raw === "string") entry = raw;
+  if (!entry) return "";
+  const match = entry.match(/[?&]filepath=([^&]+)/);
+  if (match) return decodeURIComponent(match[1]);
+  /* already a bare filepath (no URL wrapper) */
+  return entry.indexOf("/") === -1 ? entry : "";
+}
+
 function crRowToSummary(row) {
   return {
     clientId: creatorDisplayValue(row.Client_ID).trim(),
@@ -507,9 +524,9 @@ function crRowToSummary(row) {
     updatedBy: creatorDisplayValue(row.Updated_By).trim(),
     version: Number(creatorDisplayValue(row.Version)) || 0,
     recordId: row.ID,
-    /* Zoho stores a file-upload field as a path string. /download REQUIRES it:
-       without ?filepath=... it answers {"code":3790,"message":"File path is mandatory..."} */
-    filePath: creatorDisplayValue(row[CR_FILE_FIELD]).trim(),
+    /* /download REQUIRES ?filepath=<value>; without it Zoho answers
+       {"code":3790,"message":"File path is mandatory..."} */
+    filePath: crFilePathFromRow(row),
   };
 }
 
