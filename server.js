@@ -4,6 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 const app = express();
 
@@ -274,6 +275,191 @@ function creatorRecordTime(record) {
   return Date.parse((record && (record.Modified_Time || record.Created_Time || record.Added_Time)) || "") || Number((record && record.ID) || 0) || 0;
 }
 
+/* =====================================================================
+   DW PHASE 1 - ADVISOR AUTHENTICATION
+   ---------------------------------------------------------------------
+   Previously the advisor "login" lived in the public HTML:
+       EMPLOYEES = { 'DW001': { pass: 'docwealth2024', ... } }
+   Anyone could read it with view-source:, and the API required no login at all.
+
+   Now: advisors live in the Zoho `Advisors` form with a scrypt password hash.
+   /api/login issues an HMAC-signed session token; advisor-only routes require it.
+   Names are read from Zoho on every login, so editing Zoho changes the app.
+
+   Uses only Node's built-in crypto - no npm install.
+   ===================================================================== */
+const ADVISORS_FORM = process.env.ZOHO_ADVISORS_FORM || "";
+const ADVISORS_REPORT = process.env.ZOHO_ADVISORS_REPORT || "";
+const SESSION_SECRET = process.env.SESSION_SECRET || "";
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; /* 30 days */
+
+/* ---- password hashing (scrypt) ---- */
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(String(password), salt, 64).toString("hex");
+  return `scrypt$${salt}$${hash}`;
+}
+
+function verifyPassword(password, stored) {
+  try {
+    const parts = String(stored || "").split("$");
+    if (parts.length !== 3 || parts[0] !== "scrypt") return false;
+    const expected = Buffer.from(parts[2], "hex");
+    const actual = crypto.scryptSync(String(password), parts[1], 64);
+    return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+  } catch (error) {
+    return false;
+  }
+}
+
+/* ---- session tokens: base64url(payload).hmac ---- */
+function b64u(buf) { return Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
+function unb64u(str) { return Buffer.from(String(str).replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"); }
+
+function signToken(payload) {
+  if (!SESSION_SECRET) throw new Error("SESSION_SECRET is not set");
+  const body = b64u(JSON.stringify(payload));
+  const sig = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("hex");
+  return `${body}.${sig}`;
+}
+
+function verifyToken(token) {
+  try {
+    if (!SESSION_SECRET || !token) return null;
+    const [body, sig] = String(token).split(".");
+    if (!body || !sig) return null;
+    const expect = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("hex");
+    const a = Buffer.from(sig, "hex");
+    const b = Buffer.from(expect, "hex");
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    const payload = JSON.parse(unb64u(body));
+    if (!payload.exp || Date.now() > payload.exp) return null;
+    return payload;
+  } catch (error) {
+    return null;
+  }
+}
+
+/* ---- Zoho Advisors store ---- */
+let ADVISOR_CACHE = { at: 0, byId: new Map(), idByAdvisor: new Map() };
+const ADVISOR_TTL_MS = 60 * 1000;
+
+async function loadAdvisors(force) {
+  if (!force && Date.now() - ADVISOR_CACHE.at < ADVISOR_TTL_MS && ADVISOR_CACHE.byId.size) return ADVISOR_CACHE;
+  if (!ADVISORS_REPORT) throw new Error("ZOHO_ADVISORS_REPORT is not set");
+
+  const accessToken = await getAccessToken();
+  const response = await fetch(`${creatorUrl(ADVISORS_REPORT)}?max_records=200`, {
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+  });
+  const data = await response.json();
+  if (data && data.code && data.code !== 3000 && data.code !== 3100) throw new Error(JSON.stringify(data));
+
+  const rows = Array.isArray(data.data) ? data.data : [];
+  const byId = new Map();
+  const idByAdvisor = new Map();
+  rows.forEach((row) => {
+    const advisorId = creatorDisplayValue(row.Advisor_ID).trim().toUpperCase();
+    if (!advisorId) return;
+    byId.set(advisorId, {
+      advisorId,
+      advisorName: creatorDisplayValue(row.Advisor_Name).trim(),
+      passwordHash: creatorDisplayValue(row.Password_Hash).trim(),
+      active: creatorDisplayValue(row.Active).trim(),
+    });
+    idByAdvisor.set(advisorId, row.ID);
+  });
+  ADVISOR_CACHE = { at: Date.now(), byId, idByAdvisor };
+  return ADVISOR_CACHE;
+}
+
+async function upsertAdvisor(advisorId, fields) {
+  if (!ADVISORS_FORM || !ADVISORS_REPORT) throw new Error("Advisors form/report env vars not set");
+  const index = await loadAdvisors(true);
+  const recordId = index.idByAdvisor.get(advisorId) || null;
+  const accessToken = await getAccessToken();
+
+  const response = recordId
+    ? await fetch(`${creatorUrl(ADVISORS_REPORT)}/${recordId}`, {
+        method: "PATCH",
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ data: fields }),
+      })
+    : await fetch(creatorFormUrl(ADVISORS_FORM), {
+        method: "POST",
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ data: [fields] }),
+      });
+
+  const data = await response.json();
+  if (data && data.code && data.code !== 3000) throw new Error(JSON.stringify(data));
+  ADVISOR_CACHE.at = 0;
+  return data;
+}
+
+/* ---- middleware: advisor-only routes ---- */
+function requireAuth(req, res, next) {
+  const header = String(req.headers.authorization || "");
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  const payload = verifyToken(token);
+  if (!payload) return res.status(401).json({ ok: false, error: "login_required" });
+  req.advisor = payload;
+  next();
+}
+
+/* ---- one-time / repeat advisor setup, guarded by ADMIN_KEY ---- */
+app.post("/api/advisor-setup", async (req, res) => {
+  try {
+    if (!ADMIN_KEY) return res.status(500).json({ ok: false, error: "ADMIN_KEY not set" });
+    const supplied = String(req.headers["x-admin-key"] || "");
+    const a = Buffer.from(supplied);
+    const b = Buffer.from(ADMIN_KEY);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    const advisorId = String((req.body && req.body.advisorId) || "").trim().toUpperCase();
+    const advisorName = String((req.body && req.body.advisorName) || "").trim();
+    const password = String((req.body && req.body.password) || "");
+    if (!advisorId || !password) return res.status(400).json({ ok: false, error: "advisorId and password required" });
+    if (password.length < 8) return res.status(400).json({ ok: false, error: "password must be at least 8 characters" });
+
+    const fields = { Advisor_ID: advisorId, Password_Hash: hashPassword(password), Active: "Yes" };
+    if (advisorName) fields.Advisor_Name = advisorName;
+    await upsertAdvisor(advisorId, fields);
+    res.json({ ok: true, advisorId, message: "Advisor saved. Password is stored hashed." });
+  } catch (error) {
+    console.error("[DocWealth] advisor-setup failed", error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post("/api/login", async (req, res) => {
+  try {
+    const advisorId = String((req.body && req.body.advisorId) || "").trim().toUpperCase();
+    const password = String((req.body && req.body.password) || "");
+    if (!advisorId || !password) return res.status(400).json({ ok: false, error: "missing_credentials" });
+
+    const index = await loadAdvisors();
+    const advisor = index.byId.get(advisorId);
+    if (!advisor || !advisor.passwordHash) return res.status(401).json({ ok: false, error: "invalid_credentials" });
+    if (advisor.active && advisor.active.toLowerCase() === "no") return res.status(403).json({ ok: false, error: "account_disabled" });
+    if (!verifyPassword(password, advisor.passwordHash)) return res.status(401).json({ ok: false, error: "invalid_credentials" });
+
+    const token = signToken({ sub: advisorId, name: advisor.advisorName || advisorId, exp: Date.now() + SESSION_TTL_MS });
+    upsertAdvisor(advisorId, { Advisor_ID: advisorId, Last_Login: new Date().toISOString() }).catch(function () {});
+    res.json({ ok: true, token, advisor: { id: advisorId, name: advisor.advisorName || advisorId } });
+  } catch (error) {
+    console.error("[DocWealth] login failed", error.message);
+    res.status(500).json({ ok: false, error: "login_unavailable" });
+  }
+});
+
+app.get("/api/me", requireAuth, (req, res) => {
+  res.json({ ok: true, advisor: { id: req.advisor.sub, name: req.advisor.name } });
+});
+
 /* Zoho Documents report is the truth for "did this client submit?".
    Used to self-heal a portal link whose status was never marked Submitted. */
 const ZOHO_SUBMIT_CACHE = new Map();
@@ -324,7 +510,7 @@ app.get("/health", (req, res) => {
   res.json({ ok: true, message: "DocWealth backend is running" });
 });
 
-app.get("/api/zoho-test", async (req, res) => {
+app.get("/api/zoho-test", requireAuth, async (req, res) => {
   try {
     const accessToken = await getAccessToken();
     const response = await fetch(`${creatorUrl(process.env.ZOHO_CLIENTS_REPORT)}?max_records=200`, {
@@ -337,7 +523,7 @@ app.get("/api/zoho-test", async (req, res) => {
   }
 });
 
-app.get("/api/portal-data", async (req, res) => {
+app.get("/api/portal-data", requireAuth, async (req, res) => {
   try {
     const clientId = String(req.query.clientId || "").trim();
     const token = String(req.query.token || "").trim();
@@ -379,14 +565,14 @@ app.get("/api/portal-data", async (req, res) => {
   }
 });
 
-app.post("/api/client-link", async (req, res) => {
+app.post("/api/client-link", requireAuth, async (req, res) => {
   const payload = req.body || {};
   if (!payload.clientId || !payload.portalToken) return res.status(400).json({ ok: false, error: "Missing clientId or portalToken" });
   const record = await upsertPortalRecord(payload);
   res.json({ ok: true, portal: publicPortalRecord(record) });
 });
 
-app.post("/api/portal-sent", async (req, res) => {
+app.post("/api/portal-sent", requireAuth, async (req, res) => {
   const payload = req.body || {};
   if (!payload.clientId || !payload.portalToken) return res.status(400).json({ ok: false, error: "Missing clientId or portalToken" });
   const existing = await findPortalRecord(payload.clientId, payload.portalToken);
@@ -395,7 +581,7 @@ app.post("/api/portal-sent", async (req, res) => {
   res.json({ ok: true, portal: publicPortalRecord(record) });
 });
 
-app.post("/api/request-correction", async (req, res) => {
+app.post("/api/request-correction", requireAuth, async (req, res) => {
   const payload = req.body || {};
   if (!payload.clientId || !payload.portalToken) return res.status(400).json({ ok: false, error: "Missing clientId or portalToken" });
   const record = await upsertPortalRecord(payload, { portalStatus: "Needs Correction", correctionRequestedAt: new Date().toISOString() });
