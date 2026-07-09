@@ -299,7 +299,13 @@ const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; /* 30 days */
    Treat them as an empty list, never as an error. */
 function zohoIsEmptyReport(data) {
   if (!data || !data.code) return false;
-  return data.code === 3100 || data.code === 9220;
+  /* Zoho signals "nothing to return" with several different codes:
+       3100 - no records (older API)
+       9220 - "No records exist in this report."     (empty report)
+       9280 - "No records found matching criteria."  (criteria search matched nothing)
+     None of these is an error. 9280 in particular is the normal answer when we look up
+     a client that does not exist yet - i.e. every time we create one. */
+  return data.code === 3100 || data.code === 9220 || data.code === 9280;
 }
 
 /* ---- password hashing (scrypt) ---- */
@@ -539,6 +545,18 @@ async function crUpsertRow(clientId, fields) {
   });
   const data = await response.json();
   if (data && data.code && data.code !== 3000) throw new Error(JSON.stringify(data));
+
+  /* Prefer the ID Zoho returns from the insert. Re-querying by criteria can briefly
+     miss a just-created row while the report index catches up. */
+  let newId = null;
+  try {
+    const first = Array.isArray(data.data) ? data.data[0] : null;
+    newId = (first && ((first.data && first.data.ID) || first.ID)) || null;
+  } catch (error) {
+    newId = null;
+  }
+  if (newId) return newId;
+
   const created = await crFindRow(clientId);
   if (!created) throw new Error("record created but not found in report");
   return created.recordId;
