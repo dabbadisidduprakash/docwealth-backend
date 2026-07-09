@@ -538,7 +538,9 @@ async function crClientRows(clientId) {
 
 async function crFindRow(clientId) {
   const rows = await crClientRows(clientId);
-  return rows.length ? rows[0] : null;
+  /* prefer the newest row that actually has a file attached */
+  const withFile = rows.find((r) => r.filePath);
+  return withFile || (rows.length ? rows[0] : null);
 }
 
 async function crDeleteRow(recordId) {
@@ -552,7 +554,25 @@ async function crDeleteRow(recordId) {
   return true;
 }
 
-async function crInsertRow(fields) {
+/* Zoho's "add records" response shape varies by version, so we do NOT depend on it.
+   Fast path: read the ID if it is there. Otherwise look the row up by the Version we
+   just wrote (unique per client) - allowing a moment for the report index to catch up. */
+function crExtractInsertedId(data) {
+  const candidates = [];
+  try {
+    if (Array.isArray(data && data.data)) candidates.push(data.data[0]);
+    if (Array.isArray(data && data.result)) candidates.push(data.result[0]);
+    if (data && data.data && !Array.isArray(data.data)) candidates.push(data.data);
+  } catch (error) { /* ignore */ }
+  for (const c of candidates) {
+    if (!c) continue;
+    const id = (c.data && (c.data.ID || c.data.id)) || c.ID || c.id;
+    if (id) return String(id);
+  }
+  return null;
+}
+
+async function crInsertRow(clientId, fields) {
   if (!CR_FORM) throw new Error("ZOHO_CLIENT_RECORDS_FORM is not set");
   const accessToken = await getAccessToken();
   const response = await fetch(creatorFormUrl(CR_FORM), {
@@ -562,13 +582,32 @@ async function crInsertRow(fields) {
   });
   const data = await response.json();
   if (data && data.code && data.code !== 3000) throw new Error(JSON.stringify(data));
-  let newId = null;
-  try {
-    const first = Array.isArray(data.data) ? data.data[0] : null;
-    newId = (first && ((first.data && first.data.ID) || first.ID)) || null;
-  } catch (error) { newId = null; }
-  if (!newId) throw new Error("insert succeeded but no record ID returned");
-  return newId;
+
+  const fast = crExtractInsertedId(data);
+  if (fast) return fast;
+
+  /* Fallback: find the row carrying the Version we just wrote. */
+  const wanted = Number(fields.Version);
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const rows = await crClientRows(clientId);
+    const hit = rows.find((r) => r.version === wanted);
+    if (hit) return hit.recordId;
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+  throw new Error("insert succeeded but the new row could not be located");
+}
+
+/* Rows whose file upload never completed carry no filePath. They must never be treated
+   as the newest good version, so remove them before writing. */
+async function crPurgeFilelessRows(clientId) {
+  const rows = await crClientRows(clientId);
+  const orphans = rows.filter((r) => !r.filePath);
+  for (const row of orphans) {
+    await crDeleteRow(row.recordId).catch(function (error) {
+      console.error("[DocWealth] could not delete fileless row", row.recordId, error.message);
+    });
+  }
+  return orphans.length;
 }
 
 async function crUploadRecordFile(recordId, clientId, recordJson) {
@@ -654,6 +693,7 @@ app.post("/api/client/:clientId", requireAuth, async (req, res) => {
     if (!record || typeof record !== "object") return res.status(400).json({ ok: false, error: "missing_record" });
 
     const baseVersion = Number(body.baseVersion);
+    await crPurgeFilelessRows(clientId);          /* clear any half-written row first */
     const rows = await crClientRows(clientId);
     const existing = rows.length ? rows[0] : null;
 
@@ -675,7 +715,7 @@ app.post("/api/client/:clientId", requireAuth, async (req, res) => {
     const updatedBy = `${advisorName} (${advisorId})`;
 
     /* 1. write a brand-new row (one file per row - see crClientRows) */
-    const recordId = await crInsertRow({
+    const recordId = await crInsertRow(clientId, {
       Client_ID: clientId,
       Client_Name: clientName,
       Updated_At: new Date().toISOString(),
