@@ -503,19 +503,30 @@ function crRowToSummary(row) {
     updatedBy: creatorDisplayValue(row.Updated_By).trim(),
     version: Number(creatorDisplayValue(row.Version)) || 0,
     recordId: row.ID,
+     filePath: creatorDisplayValue(row[CR_FILE_FIELD]).trim(),
   };
 }
 
-async function crFetchRows(criteria) {
-  if (!CR_REPORT) throw new Error("ZOHO_CLIENT_RECORDS_REPORT is not set");
+async function crDownloadRecordFile(recordId, filePath) {
+  if (!filePath) throw new Error("no record file attached to this client");
   const accessToken = await getAccessToken();
-  let url = `${creatorUrl(CR_REPORT)}?max_records=200`;
-  if (criteria) url += `&criteria=${encodeURIComponent(criteria)}`;
+  const url = `${creatorUrl(CR_REPORT)}/${recordId}/${CR_FILE_FIELD}/download?filepath=${encodeURIComponent(filePath)}`;
   const response = await fetch(url, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
-  const data = await response.json();
-  if (data && data.code && data.code !== 3000 && !zohoIsEmptyReport(data)) throw new Error(JSON.stringify(data));
-  const rows = (!zohoIsEmptyReport(data) && Array.isArray(data.data)) ? data.data : [];
-  return rows;
+  if (!response.ok) throw new Error("file download failed: HTTP " + response.status);
+
+  const text = await response.text();
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    throw new Error("stored record is not valid JSON");
+  }
+
+  /* A Zoho error is itself valid JSON, e.g. {"code":3790,...}. Never hand that back as a record. */
+  if (parsed && typeof parsed === "object" && parsed.code && (parsed.message || parsed.description) && !Object.prototype.hasOwnProperty.call(parsed, "fields")) {
+    throw new Error("zoho download error: " + JSON.stringify(parsed));
+  }
+  return parsed;
 }
 
 async function crFindRow(clientId) {
@@ -610,7 +621,8 @@ app.get("/api/client/:clientId", requireAuth, async (req, res) => {
     if (!clientId) return res.status(400).json({ ok: false, error: "missing_client_id" });
     const row = await crFindRow(clientId);
     if (!row) return res.status(404).json({ ok: false, error: "not_found" });
-    const record = await crDownloadRecordFile(row.recordId);
+    if (!row.filePath) return res.status(404).json({ ok: false, error: "no_record_file" });
+    const record = await crDownloadRecordFile(row.recordId, row.filePath);
     res.json({ ok: true, clientId, version: row.version, updatedAt: row.updatedAt, updatedBy: row.updatedBy, record });
   } catch (error) {
     console.error("[DocWealth] GET /api/client failed", error.message);
