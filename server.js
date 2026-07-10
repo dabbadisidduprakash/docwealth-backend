@@ -664,6 +664,209 @@ async function crDownloadRecordFile(recordId, filePath) {
   return parsed;
 }
 
+/* =====================================================================
+   CLIENT DOCUMENTS - REAL UPLOAD FROM THE DOCTOR PORTAL
+   ---------------------------------------------------------------------
+   Until now the portal's "Secure Document Vault" only recorded file.name and
+   file.size and showed a "Document Uploaded" toast. It never read the file's
+   contents (no FileReader, no FormData) and /api/portal-submit sent only JSON.
+   Every client's documents stayed on their own laptop.
+
+   Now the portal base64-encodes each file and POSTs it here. One Zoho row per file.
+   Authenticated with the same clientId+portalToken guard as /api/portal-submit.
+
+   5 MB cap: base64 inflates by ~33%, so 5 MB of file is ~6.7 MB of JSON - safely
+   inside the 25 MB body limit and kind to a 512 MB free-tier Render instance.
+   ===================================================================== */
+const DOCS_FORM = process.env.ZOHO_CLIENT_DOCS_FORM || "";
+const DOCS_REPORT = process.env.ZOHO_CLIENT_DOCS_REPORT || "";
+const DOCS_FILE_FIELD = process.env.ZOHO_CLIENT_DOCS_FILE_FIELD || "Doc_File";
+const DOC_MAX_BYTES = 5 * 1024 * 1024;
+const DOC_ALLOWED_EXT = ["pdf","jpg","jpeg","png","webp","doc","docx","xls","xlsx","csv"];
+
+function docFilePathFromRow(row) {
+  const raw = row && row[DOCS_FILE_FIELD];
+  let entry = "";
+  if (Array.isArray(raw)) entry = raw.length ? String(raw[raw.length - 1]) : "";
+  else if (typeof raw === "string") entry = raw;
+  if (!entry) return "";
+  const match = entry.match(/[?&]filepath=([^&]+)/);
+  if (match) return decodeURIComponent(match[1]);
+  return entry.indexOf("/") === -1 ? entry : "";
+}
+
+function docRowToSummary(row) {
+  return {
+    recordId: row.ID,
+    clientId: creatorDisplayValue(row.Client_ID).trim(),
+    section: creatorDisplayValue(row.Section).trim(),
+    documentType: creatorDisplayValue(row.Document_Type).trim(),
+    fileName: creatorDisplayValue(row.File_Name).trim(),
+    uploadedAt: creatorDisplayValue(row.Uploaded_At).trim(),
+    hasFile: !!docFilePathFromRow(row),
+    filePath: docFilePathFromRow(row),
+  };
+}
+
+async function docFetchRows(criteria) {
+  if (!DOCS_REPORT) throw new Error("ZOHO_CLIENT_DOCS_REPORT is not set");
+  const accessToken = await getAccessToken();
+  let url = `${creatorUrl(DOCS_REPORT)}?max_records=200`;
+  if (criteria) url += `&criteria=${encodeURIComponent(criteria)}`;
+  const response = await fetch(url, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+  const data = await response.json();
+  if (data && data.code && data.code !== 3000 && !zohoIsEmptyReport(data)) throw new Error(JSON.stringify(data));
+  return (!zohoIsEmptyReport(data) && Array.isArray(data.data)) ? data.data : [];
+}
+
+async function docInsertRow(fields) {
+  if (!DOCS_FORM) throw new Error("ZOHO_CLIENT_DOCS_FORM is not set");
+  const accessToken = await getAccessToken();
+  const response = await fetch(creatorFormUrl(DOCS_FORM), {
+    method: "POST",
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ data: [fields] }),
+  });
+  const data = await response.json();
+  if (data && data.code && data.code !== 3000) throw new Error(JSON.stringify(data));
+  const id = crExtractInsertedId(data);
+  if (id) return id;
+  /* fall back to locating the row we just wrote */
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const rows = await docFetchRows(`Client_ID=="${String(fields.Client_ID).replace(/"/g, "")}"`);
+    const hit = rows.map(docRowToSummary).find((r) => r.fileName === fields.File_Name && r.uploadedAt === fields.Uploaded_At);
+    if (hit) return hit.recordId;
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+  throw new Error("document row created but could not be located");
+}
+
+async function docUploadFile(recordId, fileName, buffer, mimeType) {
+  const accessToken = await getAccessToken();
+  const form = new FormData();
+  form.append("file", new Blob([buffer], { type: mimeType || "application/octet-stream" }), fileName);
+  const response = await fetch(`${creatorUrl(DOCS_REPORT)}/${recordId}/${DOCS_FILE_FIELD}/upload`, {
+    method: "POST",
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+    body: form,
+  });
+  const data = await response.json().catch(function () { return null; });
+  if (data && data.code && data.code !== 3000) throw new Error(JSON.stringify(data));
+  return true;
+}
+
+async function docDeleteRow(recordId) {
+  const accessToken = await getAccessToken();
+  const response = await fetch(`${creatorUrl(DOCS_REPORT)}/${recordId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+  });
+  const data = await response.json().catch(function () { return null; });
+  if (data && data.code && data.code !== 3000) throw new Error(JSON.stringify(data));
+  return true;
+}
+
+/* ---- the doctor portal uploads a file (no advisor login; client token guards it) ---- */
+app.post("/api/portal-upload", async (req, res) => {
+  try {
+    const payload = req.body || {};
+    const clientId = String(payload.clientId || "");
+    const portalToken = String(payload.portalToken || "");
+
+    const existing = await findPortalRecord(clientId, portalToken);
+    if (!existing) {
+      console.warn("[DocWealth] rejected portal-upload for unregistered client:", clientId);
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    const fileName = String(payload.fileName || "").trim().slice(0, 200);
+    const base64 = String(payload.dataBase64 || "");
+    if (!fileName || !base64) return res.status(400).json({ ok: false, error: "missing_file" });
+
+    const ext = (fileName.split(".").pop() || "").toLowerCase();
+    if (DOC_ALLOWED_EXT.indexOf(ext) === -1) return res.status(400).json({ ok: false, error: "file_type_not_allowed" });
+
+    const buffer = Buffer.from(base64, "base64");
+    if (!buffer.length) return res.status(400).json({ ok: false, error: "empty_file" });
+    if (buffer.length > DOC_MAX_BYTES) {
+      return res.status(413).json({ ok: false, error: "file_too_large", maxBytes: DOC_MAX_BYTES });
+    }
+
+    const uploadedAt = new Date().toISOString();
+    const recordId = await docInsertRow({
+      Client_ID: clientId,
+      Section: String(payload.section || "").slice(0, 200),
+      Document_Type: String(payload.documentType || "").slice(0, 200),
+      File_Name: fileName,
+      Uploaded_At: uploadedAt,
+    });
+
+    try {
+      await docUploadFile(recordId, fileName, buffer, payload.mimeType);
+    } catch (error) {
+      await docDeleteRow(recordId).catch(function () {});   /* never leave a fileless row */
+      throw error;
+    }
+
+    res.json({ ok: true, recordId, fileName, uploadedAt, size: buffer.length });
+  } catch (error) {
+    console.error("[DocWealth] portal-upload failed", error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+/* ---- advisor: list a client's documents ---- */
+app.get("/api/client-docs/:clientId", requireAuth, async (req, res) => {
+  try {
+    const clientId = String(req.params.clientId || "").trim();
+    const rows = await docFetchRows(`Client_ID=="${clientId.replace(/"/g, "")}"`);
+    const documents = rows.map(docRowToSummary)
+      .sort((a, b) => String(b.uploadedAt).localeCompare(String(a.uploadedAt)))
+      .map(function (d) { delete d.filePath; return d; });
+    res.json({ ok: true, clientId, documents });
+  } catch (error) {
+    console.error("[DocWealth] client-docs list failed", error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+/* ---- advisor: download one document ---- */
+app.get("/api/client-doc/:recordId/download", requireAuth, async (req, res) => {
+  try {
+    const recordId = String(req.params.recordId || "").trim();
+    const rows = await docFetchRows(null);
+    const row = rows.find((r) => String(r.ID) === recordId);
+    if (!row) return res.status(404).json({ ok: false, error: "not_found" });
+    const filePath = docFilePathFromRow(row);
+    if (!filePath) return res.status(404).json({ ok: false, error: "no_file" });
+
+    const accessToken = await getAccessToken();
+    const url = `${creatorUrl(DOCS_REPORT)}/${recordId}/${DOCS_FILE_FIELD}/download?filepath=${encodeURIComponent(filePath)}`;
+    const upstream = await fetch(url, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+    if (!upstream.ok) return res.status(502).json({ ok: false, error: "zoho_download_failed" });
+
+    const fileName = creatorDisplayValue(row.File_Name).trim() || "document";
+    const bytes = Buffer.from(await upstream.arrayBuffer());
+    res.setHeader("Content-Type", upstream.headers.get("content-type") || "application/octet-stream");
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName.replace(/"/g, "")}"`);
+    res.send(bytes);
+  } catch (error) {
+    console.error("[DocWealth] client-doc download failed", error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+/* ---- advisor: delete one document ---- */
+app.delete("/api/client-doc/:recordId", requireAuth, async (req, res) => {
+  try {
+    await docDeleteRow(String(req.params.recordId || "").trim());
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("[DocWealth] client-doc delete failed", error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 /* ---- list every client (shared workspace: all advisors see all clients) ---- */
 app.get("/api/clients", requireAuth, async (req, res) => {
   try {
