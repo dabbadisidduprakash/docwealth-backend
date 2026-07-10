@@ -684,6 +684,21 @@ const DOCS_FILE_FIELD = process.env.ZOHO_CLIENT_DOCS_FILE_FIELD || "Doc_File";
 const DOC_MAX_BYTES = 5 * 1024 * 1024;
 const DOC_ALLOWED_EXT = ["pdf","jpg","jpeg","png","webp","doc","docx","xls","xlsx","csv"];
 
+/* Zoho sometimes answers with an empty body or an HTML error page. Calling .json() on that
+   throws "Unexpected end of JSON input" and hides what actually went wrong. Always read the
+   text first and report the HTTP status plus a snippet. */
+async function zohoJson(response, what) {
+  const text = await response.text();
+  if (!text || !text.trim()) {
+    throw new Error(`${what}: Zoho returned an empty body (HTTP ${response.status})`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new Error(`${what}: Zoho returned non-JSON (HTTP ${response.status}): ${text.slice(0, 200)}`);
+  }
+}
+
 function docFilePathFromRow(row) {
   const raw = row && row[DOCS_FILE_FIELD];
   let entry = "";
@@ -714,7 +729,7 @@ async function docFetchRows(criteria) {
   let url = `${creatorUrl(DOCS_REPORT)}?max_records=200`;
   if (criteria) url += `&criteria=${encodeURIComponent(criteria)}`;
   const response = await fetch(url, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
-  const data = await response.json();
+  const data = await zohoJson(response, "docs list");
   if (data && data.code && data.code !== 3000 && !zohoIsEmptyReport(data)) throw new Error(JSON.stringify(data));
   return (!zohoIsEmptyReport(data) && Array.isArray(data.data)) ? data.data : [];
 }
@@ -727,7 +742,7 @@ async function docInsertRow(fields) {
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, "Content-Type": "application/json" },
     body: JSON.stringify({ data: [fields] }),
   });
-  const data = await response.json();
+  const data = await zohoJson(response, "docs insert");
   if (data && data.code && data.code !== 3000) throw new Error(JSON.stringify(data));
   const id = crExtractInsertedId(data);
   if (id) return id;
@@ -750,7 +765,7 @@ async function docUploadFile(recordId, fileName, buffer, mimeType) {
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
     body: form,
   });
-  const data = await response.json().catch(function () { return null; });
+  const data = await zohoJson(response, "docs file upload");
   if (data && data.code && data.code !== 3000) throw new Error(JSON.stringify(data));
   return true;
 }
@@ -769,6 +784,8 @@ async function docDeleteRow(recordId) {
 /* ---- the doctor portal uploads a file (no advisor login; client token guards it) ---- */
 app.post("/api/portal-upload", async (req, res) => {
   try {
+    if (!DOCS_FORM) return res.status(500).json({ ok: false, error: "ZOHO_CLIENT_DOCS_FORM is not set in Render" });
+    if (!DOCS_REPORT) return res.status(500).json({ ok: false, error: "ZOHO_CLIENT_DOCS_REPORT is not set in Render" });
     const payload = req.body || {};
     const clientId = String(payload.clientId || "");
     const portalToken = String(payload.portalToken || "");
@@ -792,6 +809,10 @@ app.post("/api/portal-upload", async (req, res) => {
       return res.status(413).json({ ok: false, error: "file_too_large", maxBytes: DOC_MAX_BYTES });
     }
 
+    /* Zoho can be fussy about spaces and brackets in a file name. Keep the original in the
+       File_Name field for the advisor to read; upload the bytes under a safe name. */
+    const safeName = fileName.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/_+/g, "_").slice(0, 100) || ("document." + ext);
+
     const uploadedAt = new Date().toISOString();
     const recordId = await docInsertRow({
       Client_ID: clientId,
@@ -802,7 +823,7 @@ app.post("/api/portal-upload", async (req, res) => {
     });
 
     try {
-      await docUploadFile(recordId, fileName, buffer, payload.mimeType);
+      await docUploadFile(recordId, safeName, buffer, payload.mimeType);
     } catch (error) {
       await docDeleteRow(recordId).catch(function () {});   /* never leave a fileless row */
       throw error;
