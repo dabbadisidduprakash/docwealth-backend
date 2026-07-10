@@ -664,53 +664,6 @@ async function crDownloadRecordFile(recordId, filePath) {
   return parsed;
 }
 
-/* ---- TEMPORARY DIAGNOSTIC: show the raw Zoho row exactly as returned ----
-   The file-upload field's value shape is not documented clearly, and creatorDisplayValue()
-   may be collapsing it to a display name rather than the path /download needs.
-   Also reports whether a DELETE is permitted (an OAuth scope issue would explain why
-   fileless rows are not being purged). Remove once Phase 2 is stable. */
-app.get("/api/debug/row/:clientId", requireAuth, async (req, res) => {
-  try {
-    const clientId = String(req.params.clientId || "").trim();
-    const accessToken = await getAccessToken();
-    const url = `${creatorUrl(CR_REPORT)}?max_records=200&criteria=${encodeURIComponent(`Client_ID=="${clientId}"`)}`;
-    const response = await fetch(url, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
-    const data = await response.json();
-    const rows = Array.isArray(data.data) ? data.data : [];
-    res.json({
-      ok: true,
-      zohoCode: data.code,
-      rowCount: rows.length,
-      fileFieldName: CR_FILE_FIELD,
-      rawRows: rows.map((r) => ({
-        ID: r.ID,
-        Version: r.Version,
-        rawFileField: r[CR_FILE_FIELD],
-        rawFileFieldType: typeof r[CR_FILE_FIELD],
-        viaCreatorDisplayValue: creatorDisplayValue(r[CR_FILE_FIELD]),
-        allKeys: Object.keys(r),
-      })),
-    });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
-/* ---- TEMPORARY DIAGNOSTIC: does our OAuth token allow DELETE? ---- */
-app.get("/api/debug/candelete/:recordId", requireAuth, async (req, res) => {
-  try {
-    const accessToken = await getAccessToken();
-    const response = await fetch(`${creatorUrl(CR_REPORT)}/${String(req.params.recordId)}`, {
-      method: "DELETE",
-      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
-    });
-    const text = await response.text();
-    res.json({ ok: true, httpStatus: response.status, zohoResponse: text.slice(0, 500) });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
-
 /* ---- list every client (shared workspace: all advisors see all clients) ---- */
 app.get("/api/clients", requireAuth, async (req, res) => {
   try {
