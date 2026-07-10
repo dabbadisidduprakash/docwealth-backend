@@ -681,6 +681,9 @@ async function crDownloadRecordFile(recordId, filePath) {
 const DOCS_FORM = process.env.ZOHO_CLIENT_DOCS_FORM || "";
 const DOCS_REPORT = process.env.ZOHO_CLIENT_DOCS_REPORT || "";
 const DOCS_FILE_FIELD = process.env.ZOHO_CLIENT_DOCS_FILE_FIELD || "Doc_File";
+/* Zoho reserves "Section", so the field it actually created is "Section1".
+   Writing to "Section" was silently ignored and the column stayed blank. */
+const DOCS_SECTION_FIELD = process.env.ZOHO_CLIENT_DOCS_SECTION_FIELD || "Section1";
 const DOC_MAX_BYTES = 5 * 1024 * 1024;
 const DOC_ALLOWED_EXT = ["pdf","jpg","jpeg","png","webp","doc","docx","xls","xlsx","csv"];
 
@@ -714,7 +717,7 @@ function docRowToSummary(row) {
   return {
     recordId: row.ID,
     clientId: creatorDisplayValue(row.Client_ID).trim(),
-    section: creatorDisplayValue(row.Section).trim(),
+    section: creatorDisplayValue(row[DOCS_SECTION_FIELD]).trim(),
     documentType: creatorDisplayValue(row.Document_Type).trim(),
     fileName: creatorDisplayValue(row.File_Name).trim(),
     uploadedAt: creatorDisplayValue(row.Uploaded_At).trim(),
@@ -814,13 +817,14 @@ app.post("/api/portal-upload", async (req, res) => {
     const safeName = fileName.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/_+/g, "_").slice(0, 100) || ("document." + ext);
 
     const uploadedAt = new Date().toISOString();
-    const recordId = await docInsertRow({
+    const docFields = {
       Client_ID: clientId,
-      Section: String(payload.section || "").slice(0, 200),
       Document_Type: String(payload.documentType || "").slice(0, 200),
       File_Name: fileName,
       Uploaded_At: uploadedAt,
-    });
+    };
+    docFields[DOCS_SECTION_FIELD] = String(payload.section || "").slice(0, 200);
+    const recordId = await docInsertRow(docFields);
 
     try {
       await docUploadFile(recordId, safeName, buffer, payload.mimeType);
