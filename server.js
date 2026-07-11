@@ -1294,6 +1294,69 @@ app.get("/api/portal-data", requireAuth, async (req, res) => {
   }
 });
 
+/* ---- one-time cleanup: keep ONLY the given client IDs, delete all other rows ----
+   Used to remove dead test-client rows (bomu, TEST-999, etc.) from Portal_Links and
+   the portal-submission form. The keep-list is passed in the request body and must be
+   non-empty, so an accidental empty list can never wipe everything. */
+async function purgeRowsNotInList(reportLink, clientIdFieldReader, keepIds) {
+  const accessToken = await getAccessToken();
+  const response = await fetch(`${creatorUrl(reportLink)}?max_records=500`, {
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+  });
+  const data = await response.json();
+  const rows = (!zohoIsEmptyReport(data) && Array.isArray(data.data)) ? data.data : [];
+
+  const keep = new Set(keepIds);
+  const toDelete = rows.filter((row) => !keep.has(clientIdFieldReader(row))).map((row) => row.ID);
+
+  let deleted = 0, failed = 0;
+  for (const id of toDelete) {
+    try {
+      const r = await fetch(`${creatorUrl(reportLink)}/${id}`, {
+        method: "DELETE",
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+      });
+      const d = await r.json().catch(() => null);
+      if (d && d.code && d.code !== 3000) { failed++; } else { deleted++; }
+    } catch (e) { failed++; }
+  }
+  return { totalRows: rows.length, kept: rows.length - toDelete.length, deleted, failed };
+}
+
+app.post("/api/keep-only-clients", requireAuth, async (req, res) => {
+  try {
+    const keepIds = Array.isArray(req.body && req.body.keepClientIds)
+      ? req.body.keepClientIds.map((x) => String(x).trim()).filter(Boolean)
+      : [];
+    if (!keepIds.length) {
+      return res.status(400).json({ ok: false, error: "keepClientIds must be a non-empty list" });
+    }
+
+    const results = {};
+    /* Portal_Links */
+    results.portalLinks = await purgeRowsNotInList(
+      PORTAL_LINKS_REPORT,
+      (row) => portalLinkFromZoho(row).clientId,
+      keepIds
+    );
+    /* portal-submission form */
+    if (process.env.ZOHO_DOCUMENTS_REPORT) {
+      results.submissions = await purgeRowsNotInList(
+        process.env.ZOHO_DOCUMENTS_REPORT,
+        (row) => portalRecordClientId(row),
+        keepIds
+      );
+    }
+
+    LINKS_CACHE = { at: 0, byKey: new Map(), idByKey: new Map(), byClient: new Map(), idByClient: new Map() };
+    if (ZOHO_SUBMIT_CACHE.clear) ZOHO_SUBMIT_CACHE.clear();
+    res.json({ ok: true, keptClientIds: keepIds, results });
+  } catch (error) {
+    console.error("[DocWealth] keep-only-clients failed", error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 /* ---- one-time cleanup: remove duplicate portal-submission rows, keep newest per client ---- */
 app.post("/api/portal-submissions-dedupe", requireAuth, async (req, res) => {
   try {
