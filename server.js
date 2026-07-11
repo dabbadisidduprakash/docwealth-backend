@@ -1445,26 +1445,41 @@ app.post("/api/portal-links-dedupe", requireAuth, async (req, res) => {
 });
 
 app.post("/api/client-link", requireAuth, async (req, res) => {
-  const payload = req.body || {};
-  if (!payload.clientId || !payload.portalToken) return res.status(400).json({ ok: false, error: "Missing clientId or portalToken" });
-  const record = await upsertPortalRecord(payload);
-  res.json({ ok: true, portal: publicPortalRecord(record) });
+  try {
+    const payload = req.body || {};
+    if (!payload.clientId || !payload.portalToken) return res.status(400).json({ ok: false, error: "Missing clientId or portalToken" });
+    const record = await upsertPortalRecord(payload);
+    res.json({ ok: true, portal: publicPortalRecord(record) });
+  } catch (error) {
+    console.error("[DocWealth] client-link failed", error.message);
+    res.status(500).json({ ok: false, error: "Could not save the portal link. Please try again." });
+  }
 });
 
 app.post("/api/portal-sent", requireAuth, async (req, res) => {
-  const payload = req.body || {};
-  if (!payload.clientId || !payload.portalToken) return res.status(400).json({ ok: false, error: "Missing clientId or portalToken" });
-  const existing = await findPortalRecord(payload.clientId, payload.portalToken);
-  const nextStatus = existing && existing.portalStatus === "Needs Correction" ? "Needs Correction" : "Sent";
-  const record = await upsertPortalRecord(payload, { portalStatus: nextStatus, lastSentAt: new Date().toISOString() });
-  res.json({ ok: true, portal: publicPortalRecord(record) });
+  try {
+    const payload = req.body || {};
+    if (!payload.clientId || !payload.portalToken) return res.status(400).json({ ok: false, error: "Missing clientId or portalToken" });
+    const existing = await findPortalRecord(payload.clientId, payload.portalToken);
+    const nextStatus = existing && existing.portalStatus === "Needs Correction" ? "Needs Correction" : "Sent";
+    const record = await upsertPortalRecord(payload, { portalStatus: nextStatus, lastSentAt: new Date().toISOString() });
+    res.json({ ok: true, portal: publicPortalRecord(record) });
+  } catch (error) {
+    console.error("[DocWealth] portal-sent failed", error.message);
+    res.status(500).json({ ok: false, error: "Could not update the portal status. Please try again." });
+  }
 });
 
 app.post("/api/request-correction", requireAuth, async (req, res) => {
-  const payload = req.body || {};
-  if (!payload.clientId || !payload.portalToken) return res.status(400).json({ ok: false, error: "Missing clientId or portalToken" });
-  const record = await upsertPortalRecord(payload, { portalStatus: "Needs Correction", correctionRequestedAt: new Date().toISOString() });
-  res.json({ ok: true, portal: publicPortalRecord(record) });
+  try {
+    const payload = req.body || {};
+    if (!payload.clientId || !payload.portalToken) return res.status(400).json({ ok: false, error: "Missing clientId or portalToken" });
+    const record = await upsertPortalRecord(payload, { portalStatus: "Needs Correction", correctionRequestedAt: new Date().toISOString() });
+    res.json({ ok: true, portal: publicPortalRecord(record) });
+  } catch (error) {
+    console.error("[DocWealth] request-correction failed", error.message);
+    res.status(500).json({ ok: false, error: "Could not request a correction. Please try again." });
+  }
 });
 
 /* THE BUG: the old fallback answered {ok:true,status:"Open"} for EVERY unknown client -
@@ -1472,6 +1487,7 @@ app.post("/api/request-correction", requireAuth, async (req, res) => {
    Now: unknown => 401 (the frontend keeps whatever it knows). Known but not yet marked
    submitted => ask the Zoho Documents report, and self-heal. */
 app.get("/api/portal-status", async (req, res) => {
+ try {
   const clientId = String(req.query.clientId || "").trim();
   const token = String(req.query.token || "").trim();
   if (!clientId || !token) return res.status(400).json({ ok: false, error: "missing_params" });
@@ -1497,6 +1513,10 @@ app.get("/api/portal-status", async (req, res) => {
   }
 
   res.json({ ok: true, status, portal: publicPortalRecord(record) });
+ } catch (error) {
+   console.error("[DocWealth] portal-status failed", error.message);
+   res.status(500).json({ ok: false, error: "status_check_failed" });
+ }
 });
 
 app.post("/api/portal-submit", async (req, res) => {
@@ -1519,27 +1539,52 @@ app.post("/api/portal-submit", async (req, res) => {
     }
 
     const accessToken = await getAccessToken();
-    const response = await fetch(creatorFormUrl(process.env.ZOHO_DOCUMENTS_FORM), {
-      method: "POST",
-      headers: {
-        Authorization: `Zoho-oauthtoken ${accessToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        data: [
-          {
-            Client_ID: clientId,
-            Section_Name: "Full Portal",
-            Document_Type: "Portal JSON",
-            Submission_Status: "Pending Review",
-            Planner_Notes: "",
-            Portal_JSON: JSON.stringify(payload.portalData || {}, null, 2),
-          },
-        ],
-      }),
-    });
+    const submissionFields = {
+      Client_ID: clientId,
+      Section_Name: "Full Portal",
+      Document_Type: "Portal JSON",
+      Submission_Status: "Pending Review",
+      Planner_Notes: "",
+      Portal_JSON: JSON.stringify(payload.portalData || {}, null, 2),
+    };
 
-    const data = await response.json();
+    /* ONE submission row per client. Previously every submit INSERTED a new row, so a
+       client who submitted (or the app re-saved) many times left dozens of rows behind.
+       Now: find this client's existing row and UPDATE it; only insert if none exists. */
+    let existingRowId = null;
+    try {
+      const rep = process.env.ZOHO_DOCUMENTS_REPORT;
+      if (rep) {
+        const listResp = await fetch(`${creatorUrl(rep)}?max_records=200`, {
+          headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+        });
+        const listData = await listResp.json();
+        const rows = (!zohoIsEmptyReport(listData) && Array.isArray(listData.data)) ? listData.data : [];
+        /* rows come oldest-first; keep the newest existing row for this client */
+        rows.forEach((row) => {
+          if (portalRecordClientId(row) === clientId) existingRowId = row.ID;
+        });
+      }
+    } catch (e) {
+      console.error("[DocWealth] could not check for an existing submission row:", e.message);
+    }
+
+    let data;
+    if (existingRowId) {
+      const response = await fetch(`${creatorUrl(process.env.ZOHO_DOCUMENTS_REPORT)}/${existingRowId}`, {
+        method: "PATCH",
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ data: submissionFields }),
+      });
+      data = await response.json().catch(() => null);
+    } else {
+      const response = await fetch(creatorFormUrl(process.env.ZOHO_DOCUMENTS_FORM), {
+        method: "POST",
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ data: [submissionFields] }),
+      });
+      data = await response.json();
+    }
     if (data && data.code && data.code !== 3000) return res.status(400).json({ ok: false, zohoResponse: data });
 
     if (clientId && portalToken) await upsertPortalRecord(payload, { portalStatus: "Submitted", submittedAt: new Date().toISOString() });
