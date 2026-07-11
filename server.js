@@ -784,7 +784,196 @@ async function docDeleteRow(recordId) {
   return true;
 }
 
-/* ---- the doctor portal uploads a file (no advisor login; client token guards it) ---- */
+/* =====================================================================
+   CLIENT REPORTS - advisor-generated PDFs stored in Zoho
+   ---------------------------------------------------------------------
+   When an advisor generates a report PDF in DocWealth.html, a copy of the finished
+   blob is uploaded here so every advisor can see that client's reports from any
+   machine. Same one-row-per-file pattern as Client Docs. Advisor-authenticated.
+   ===================================================================== */
+const REPORTS_FORM = process.env.ZOHO_CLIENT_REPORTS_FORM || "";
+const REPORTS_REPORT = process.env.ZOHO_CLIENT_REPORTS_REPORT || "";
+const REPORTS_FILE_FIELD = process.env.ZOHO_CLIENT_REPORTS_FILE_FIELD || "Report_File";
+const REPORT_MAX_BYTES = 13 * 1024 * 1024;   /* 10 MB file -> ~13.3 MB base64; body limit is 25 MB */
+
+function repFilePathFromRow(row) {
+  const raw = row && row[REPORTS_FILE_FIELD];
+  let entry = "";
+  if (Array.isArray(raw)) entry = raw.length ? String(raw[raw.length - 1]) : "";
+  else if (typeof raw === "string") entry = raw;
+  if (!entry) return "";
+  const match = entry.match(/[?&]filepath=([^&]+)/);
+  if (match) return decodeURIComponent(match[1]);
+  return entry.indexOf("/") === -1 ? entry : "";
+}
+
+function repRowToSummary(row) {
+  return {
+    recordId: row.ID,
+    clientId: creatorDisplayValue(row.Client_ID).trim(),
+    reportName: creatorDisplayValue(row.Report_Name).trim(),
+    reportType: creatorDisplayValue(row.Report_Type).trim(),
+    generatedBy: creatorDisplayValue(row.Generated_By).trim(),
+    generatedAt: creatorDisplayValue(row.Generated_At).trim(),
+    filePath: repFilePathFromRow(row),
+  };
+}
+
+async function repFetchRows(criteria) {
+  if (!REPORTS_REPORT) throw new Error("ZOHO_CLIENT_REPORTS_REPORT is not set");
+  const accessToken = await getAccessToken();
+  let url = `${creatorUrl(REPORTS_REPORT)}?max_records=200`;
+  if (criteria) url += `&criteria=${encodeURIComponent(criteria)}`;
+  const response = await fetch(url, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+  const data = await zohoJson(response, "reports list");
+  if (data && data.code && data.code !== 3000 && !zohoIsEmptyReport(data)) throw new Error(JSON.stringify(data));
+  return (!zohoIsEmptyReport(data) && Array.isArray(data.data)) ? data.data : [];
+}
+
+async function repInsertRow(fields) {
+  if (!REPORTS_FORM) throw new Error("ZOHO_CLIENT_REPORTS_FORM is not set");
+  const accessToken = await getAccessToken();
+  const response = await fetch(creatorFormUrl(REPORTS_FORM), {
+    method: "POST",
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ data: [fields] }),
+  });
+  const data = await zohoJson(response, "reports insert");
+  if (data && data.code && data.code !== 3000) throw new Error(JSON.stringify(data));
+  const id = crExtractInsertedId(data);
+  if (id) return id;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const rows = await repFetchRows(`Client_ID=="${String(fields.Client_ID).replace(/"/g, "")}"`);
+    const hit = rows.map(repRowToSummary).find((r) => r.reportName === fields.Report_Name && r.generatedAt === fields.Generated_At);
+    if (hit) return hit.recordId;
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+  throw new Error("report row created but could not be located");
+}
+
+async function repUploadFile(recordId, fileName, buffer) {
+  const accessToken = await getAccessToken();
+  const form = new FormData();
+  form.append("file", new Blob([buffer], { type: "application/pdf" }), fileName);
+  const response = await fetch(`${creatorUrl(REPORTS_REPORT)}/${recordId}/${REPORTS_FILE_FIELD}/upload`, {
+    method: "POST",
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+    body: form,
+  });
+  const data = await zohoJson(response, "report file upload");
+  if (data && data.code && data.code !== 3000) throw new Error(JSON.stringify(data));
+  return true;
+}
+
+async function repDeleteRow(recordId) {
+  const accessToken = await getAccessToken();
+  const response = await fetch(`${creatorUrl(REPORTS_REPORT)}/${recordId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+  });
+  const data = await response.json().catch(function () { return null; });
+  if (data && data.code && data.code !== 3000) throw new Error(JSON.stringify(data));
+  return true;
+}
+
+/* ---- advisor uploads a generated report PDF ---- */
+app.post("/api/client-report", requireAuth, async (req, res) => {
+  try {
+    if (!REPORTS_FORM) return res.status(500).json({ ok: false, error: "ZOHO_CLIENT_REPORTS_FORM is not set in Render" });
+    if (!REPORTS_REPORT) return res.status(500).json({ ok: false, error: "ZOHO_CLIENT_REPORTS_REPORT is not set in Render" });
+    const payload = req.body || {};
+    const clientId = String(payload.clientId || "").trim();
+    if (!clientId) return res.status(400).json({ ok: false, error: "missing_client_id" });
+
+    const base64 = String(payload.dataBase64 || "");
+    if (!base64) return res.status(400).json({ ok: false, error: "missing_file" });
+    const buffer = Buffer.from(base64, "base64");
+    if (!buffer.length) return res.status(400).json({ ok: false, error: "empty_file" });
+    if (buffer.length > REPORT_MAX_BYTES) return res.status(413).json({ ok: false, error: "file_too_large", maxBytes: REPORT_MAX_BYTES });
+
+    let fileName = String(payload.fileName || "report.pdf").trim().slice(0, 200);
+    if (!/\.pdf$/i.test(fileName)) fileName += ".pdf";
+    const safeName = fileName.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/_+/g, "_").slice(0, 100) || "report.pdf";
+
+    const advisorId = (req.advisor && req.advisor.sub) || "";
+    const advisorName = (req.advisor && req.advisor.name) || advisorId;
+    const generatedAt = new Date().toISOString();
+
+    const recordId = await repInsertRow({
+      Client_ID: clientId,
+      Report_Name: fileName,
+      Report_Type: String(payload.reportType || "").slice(0, 200),
+      Generated_By: `${advisorName} (${advisorId})`,
+      Generated_At: generatedAt,
+    });
+
+    try {
+      await repUploadFile(recordId, safeName, buffer);
+    } catch (error) {
+      await repDeleteRow(recordId).catch(function () {});
+      throw error;
+    }
+
+    res.json({ ok: true, recordId, fileName, generatedAt, size: buffer.length });
+  } catch (error) {
+    console.error("[DocWealth] client-report upload failed", error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+/* ---- advisor: list a client's reports ---- */
+app.get("/api/client-reports/:clientId", requireAuth, async (req, res) => {
+  try {
+    const clientId = String(req.params.clientId || "").trim();
+    const rows = await repFetchRows(`Client_ID=="${clientId.replace(/"/g, "")}"`);
+    const reports = rows.map(repRowToSummary)
+      .sort((a, b) => String(b.generatedAt).localeCompare(String(a.generatedAt)))
+      .map(function (r) { delete r.filePath; return r; });
+    res.json({ ok: true, clientId, reports });
+  } catch (error) {
+    console.error("[DocWealth] client-reports list failed", error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+/* ---- advisor: download one report ---- */
+app.get("/api/client-report/:recordId/download", requireAuth, async (req, res) => {
+  try {
+    const recordId = String(req.params.recordId || "").trim();
+    const rows = await repFetchRows(null);
+    const row = rows.find((r) => String(r.ID) === recordId);
+    if (!row) return res.status(404).json({ ok: false, error: "not_found" });
+    const filePath = repFilePathFromRow(row);
+    if (!filePath) return res.status(404).json({ ok: false, error: "no_file" });
+
+    const accessToken = await getAccessToken();
+    const url = `${creatorUrl(REPORTS_REPORT)}/${recordId}/${REPORTS_FILE_FIELD}/download?filepath=${encodeURIComponent(filePath)}`;
+    const upstream = await fetch(url, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+    if (!upstream.ok) return res.status(502).json({ ok: false, error: "zoho_download_failed" });
+
+    const fileName = creatorDisplayValue(row.Report_Name).trim() || "report.pdf";
+    const bytes = Buffer.from(await upstream.arrayBuffer());
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName.replace(/"/g, "")}"`);
+    res.send(bytes);
+  } catch (error) {
+    console.error("[DocWealth] client-report download failed", error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+/* ---- advisor: delete one report ---- */
+app.delete("/api/client-report/:recordId", requireAuth, async (req, res) => {
+  try {
+    await repDeleteRow(String(req.params.recordId || "").trim());
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("[DocWealth] client-report delete failed", error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+/* ---- the doctor portal uploads a file (no advisor login; client token guards it) ---- *//* ---- the doctor portal uploads a file (no advisor login; client token guards it) ---- */
 app.post("/api/portal-upload", async (req, res) => {
   try {
     if (!DOCS_FORM) return res.status(500).json({ ok: false, error: "ZOHO_CLIENT_DOCS_FORM is not set in Render" });
