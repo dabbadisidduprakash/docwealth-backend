@@ -100,15 +100,20 @@ async function loadPortalIndex(force) {
   const rows = (!zohoIsEmptyReport(data) && Array.isArray(data.data)) ? data.data : [];
   const byKey = new Map();
   const idByKey = new Map();
+  const byClient = new Map();     /* clientId -> newest record */
+  const idByClient = new Map();   /* clientId -> newest row ID  */
   rows.forEach((row) => {
     const rec = portalLinkFromZoho(row);
     if (!rec.clientId || !rec.portalToken) return;
     const key = portalKey(rec.clientId, rec.portalToken);
     byKey.set(key, rec);
     idByKey.set(key, row.ID);
+    /* Rows come newest-last from the report; keep the last seen per client. */
+    byClient.set(rec.clientId, rec);
+    idByClient.set(rec.clientId, row.ID);
   });
 
-  LINKS_CACHE = { at: Date.now(), byKey, idByKey };
+  LINKS_CACHE = { at: Date.now(), byKey, idByKey, byClient, idByClient };
   return LINKS_CACHE;
 }
 
@@ -119,7 +124,10 @@ async function zohoUpsertPortalLink(rec) {
   let recordId = null;
   try {
     const index = await loadPortalIndex();
-    recordId = index.idByKey.get(key) || null;
+    /* One portal row PER CLIENT. Match on clientId first so a NEW token updates the
+       existing row instead of creating a duplicate (this is what produced 177 rows).
+       Fall back to the exact clientId+token key for older data. */
+    recordId = index.idByClient.get(rec.clientId) || index.idByKey.get(key) || null;
   } catch (error) {
     console.error("[DocWealth] portal index unavailable, will insert:", error.message);
   }
@@ -1282,6 +1290,93 @@ app.get("/api/portal-data", requireAuth, async (req, res) => {
       portalData: latest.portalData,
     });
   } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+/* ---- one-time cleanup: remove duplicate portal-submission rows, keep newest per client ---- */
+app.post("/api/portal-submissions-dedupe", requireAuth, async (req, res) => {
+  try {
+    const REP = process.env.ZOHO_DOCUMENTS_REPORT;
+    if (!REP) return res.status(500).json({ ok: false, error: "ZOHO_DOCUMENTS_REPORT is not set" });
+    const accessToken = await getAccessToken();
+    const response = await fetch(`${creatorUrl(REP)}?max_records=500`, {
+      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+    });
+    const data = await response.json();
+    const rows = (!zohoIsEmptyReport(data) && Array.isArray(data.data)) ? data.data : [];
+
+    /* group by client, newest-last (report returns oldest-first) */
+    const byClient = {};
+    rows.forEach((row) => {
+      const cid = portalRecordClientId(row) || "(blank)";
+      (byClient[cid] = byClient[cid] || []).push(row.ID);
+    });
+
+    const toDelete = [];
+    Object.keys(byClient).forEach((cid) => {
+      byClient[cid].slice(0, -1).forEach((id) => toDelete.push(id));   /* keep newest */
+    });
+
+    let deleted = 0, failed = 0;
+    for (const id of toDelete) {
+      try {
+        const r = await fetch(`${creatorUrl(REP)}/${id}`, {
+          method: "DELETE",
+          headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+        });
+        const d = await r.json().catch(() => null);
+        if (d && d.code && d.code !== 3000) { failed++; } else { deleted++; }
+      } catch (e) { failed++; }
+    }
+    ZOHO_SUBMIT_CACHE.clear && ZOHO_SUBMIT_CACHE.clear();
+    res.json({ ok: true, totalRows: rows.length, kept: Object.keys(byClient).length, deleted, failed });
+  } catch (error) {
+    console.error("[DocWealth] portal-submissions dedupe failed", error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+/* ---- one-time cleanup: remove duplicate Portal_Links rows, keep newest per client ---- */
+app.post("/api/portal-links-dedupe", requireAuth, async (req, res) => {
+  try {
+    const accessToken = await getAccessToken();
+    const response = await fetch(`${creatorUrl(PORTAL_LINKS_REPORT)}?max_records=500`, {
+      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+    });
+    const data = await response.json();
+    const rows = (!zohoIsEmptyReport(data) && Array.isArray(data.data)) ? data.data : [];
+
+    /* group row IDs by client; the report returns oldest-first, so the LAST is newest */
+    const byClient = {};
+    rows.forEach((row) => {
+      const rec = portalLinkFromZoho(row);
+      const cid = rec.clientId || "(blank)";
+      (byClient[cid] = byClient[cid] || []).push(row.ID);
+    });
+
+    const toDelete = [];
+    Object.keys(byClient).forEach((cid) => {
+      const ids = byClient[cid];
+      ids.slice(0, -1).forEach((id) => toDelete.push(id));   /* keep the last (newest) */
+    });
+
+    let deleted = 0, failed = 0;
+    for (const id of toDelete) {
+      try {
+        const r = await fetch(`${creatorUrl(PORTAL_LINKS_REPORT)}/${id}`, {
+          method: "DELETE",
+          headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+        });
+        const d = await r.json().catch(() => null);
+        if (d && d.code && d.code !== 3000) { failed++; } else { deleted++; }
+      } catch (e) { failed++; }
+    }
+
+    LINKS_CACHE = { at: 0, byKey: new Map(), idByKey: new Map(), byClient: new Map(), idByClient: new Map() };
+    res.json({ ok: true, totalRows: rows.length, kept: Object.keys(byClient).length, deleted, failed });
+  } catch (error) {
+    console.error("[DocWealth] portal-links dedupe failed", error.message);
     res.status(500).json({ ok: false, error: error.message });
   }
 });
