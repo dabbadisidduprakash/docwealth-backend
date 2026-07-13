@@ -300,7 +300,7 @@ const ADVISORS_FORM = process.env.ZOHO_ADVISORS_FORM || "";
 const ADVISORS_REPORT = process.env.ZOHO_ADVISORS_REPORT || "";
 const SESSION_SECRET = process.env.SESSION_SECRET || "";
 const ADMIN_KEY = process.env.ADMIN_KEY || "";
-const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; /* 30 days */
+const SESSION_TTL_MS = 365 * 24 * 60 * 60 * 1000; /* 365 days */
 
 /* Zoho returns a non-3000 code when a report is EMPTY, and the code differs by
    API version: 3100 and 9220 both mean "no records exist in this report".
@@ -1256,11 +1256,13 @@ app.get("/api/portal-data", requireAuth, async (req, res) => {
   try {
     const clientId = String(req.query.clientId || "").trim();
     const token = String(req.query.token || "").trim();
-    if (!clientId || !token) return res.status(401).json({ ok: false, error: "unauthorized" });
-
+    if (!clientId || !token) {
+  return res.status(400).json({ ok: false, error: "missing_params" });
+}
     const portalRecord = await findPortalRecord(clientId, token);
-    if (!portalRecord) return res.status(401).json({ ok: false, error: "unauthorized" });
-
+    if (!portalRecord) {
+  return res.status(404).json({ ok: false, error: "portal_not_found" });
+}
     const accessToken = await getAccessToken();
     const response = await fetch(`${creatorUrl(process.env.ZOHO_DOCUMENTS_REPORT)}?max_records=200`, {
       headers: {
@@ -1484,7 +1486,7 @@ app.post("/api/request-correction", requireAuth, async (req, res) => {
 
 /* THE BUG: the old fallback answered {ok:true,status:"Open"} for EVERY unknown client -
    including fabricated ones - and the advisor app wrote that over each client's real status.
-   Now: unknown => 401 (the frontend keeps whatever it knows). Known but not yet marked
+   Now: unknown => 404 (the frontend keeps whatever it knows). Known but not yet marked
    submitted => ask the Zoho Documents report, and self-heal. */
 app.get("/api/portal-status", async (req, res) => {
  try {
@@ -1493,8 +1495,9 @@ app.get("/api/portal-status", async (req, res) => {
   if (!clientId || !token) return res.status(400).json({ ok: false, error: "missing_params" });
 
   const record = await findPortalRecord(clientId, token);
-  if (!record) return res.status(401).json({ ok: false, error: "unauthorized" });
-
+  if (!record) {
+  return res.status(404).json({ ok: false, error: "portal_not_found" });
+}
   const status = record.portalStatus || "Not Sent";
 
   if (status !== "Submitted" && status !== "Locked" && status !== "Needs Correction") {
