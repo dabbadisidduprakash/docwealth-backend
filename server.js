@@ -12,7 +12,7 @@ const app = express();
    app.use(cors()) allowed ANY website on the internet to call this API from a victim's
    browser. Restrict to our own origins. Override with ALLOWED_ORIGINS (comma separated). */
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
-  "https://dabbadisidduprakash.github.io,https://docwealth.in,https://www.docwealth.in")
+  "https://app.docwealth.in,https://docwealth.in,https://www.docwealth.in")
   .split(",").map((o) => o.trim()).filter(Boolean);
 
 app.use(cors({
