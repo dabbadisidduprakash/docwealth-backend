@@ -1252,7 +1252,12 @@ app.get("/api/zoho-test", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/api/portal-data", requireAuth, async (req, res) => {
+/* DW FIX: this route already authorizes safely via the clientId+token pair
+   (findPortalRecord below), same as /api/portal-status and /api/portal-submit.
+   requireAuth here was blocking the CLIENT-facing correction form (which has
+   no advisor login) from ever fetching the client's own previously-submitted
+   answers — every request came back 401 before it even checked the token. */
+app.get("/api/portal-data", async (req, res) => {
   try {
     const clientId = String(req.query.clientId || "").trim();
     const token = String(req.query.token || "").trim();
